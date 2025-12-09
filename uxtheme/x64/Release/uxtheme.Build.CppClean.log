@@ -3,6 +3,7 @@ e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\dllmain.obj
 e:\project\usb hacking\redteam\uxtheme\x64\release\uxtheme.dll
 e:\project\usb hacking\redteam\uxtheme\x64\release\uxtheme.pdb
 e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\syscalls.obj
+e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\resource.res
 e:\project\usb hacking\redteam\uxtheme\x64\release\uxtheme.lib
 e:\project\usb hacking\redteam\uxtheme\x64\release\uxtheme.exp
 e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.ipdb
@@ -17,3 +18,6 @@ e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\link.sec
 e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\link.write.1.tlog
 e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\masm.read.1u.tlog
 e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\masm.write.1u.tlog
+e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\rc.command.1.tlog
+e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\rc.read.1.tlog
+e:\project\usb hacking\redteam\uxtheme\uxtheme\x64\release\uxtheme.tlog\rc.write.1.tlog

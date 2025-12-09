@@ -1,11 +1,10 @@
 ﻿  Assembling ..\Testing\syscalls.asm...
   dllmain.cpp
-E:\Project\USB Hacking\REDTEAM\uxtheme\dllmain.cpp(180,88): warning C4244: 'argument': conversion from 'uintptr_t' to 'NTSTATUS', possible loss of data
   Previous IPDB not found, fall back to full compilation.
 uxtheme.def : warning LNK4104: export of symbol 'DllCanUnloadNow' should be PRIVATE
 uxtheme.def : warning LNK4104: export of symbol 'DllGetClassObject' should be PRIVATE
      Creating library E:\Project\USB Hacking\REDTEAM\uxtheme\x64\Release\uxtheme.lib and object E:\Project\USB Hacking\REDTEAM\uxtheme\x64\Release\uxtheme.exp
   Generating code
-  All 508 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  All 13 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
   Finished generating code
   uxtheme.vcxproj -> E:\Project\USB Hacking\REDTEAM\uxtheme\x64\Release\uxtheme.dll

